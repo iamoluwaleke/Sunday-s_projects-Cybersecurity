@@ -1,0 +1,178 @@
+#include <WiFi.h>       // ESP32 WiFi
+#include <WebServer.h>  // Simple HTTP server
+#include <DNSServer.h>  // For captive portal
+
+// ---------- WiFi AP settings ----------
+const char* AP_SSID     = "SMART_HOME_SECURITY";   // 
+const char* AP_PASSWORD = "123454321";         //
+
+IPAddress apIP(192, 168, 4, 1);    // AP IP
+IPAddress netMsk(255, 255, 255, 0);
+
+// ---------- DNS settings ----------
+const byte DNS_PORT = 53;
+DNSServer dnsServer;
+
+// ---------- Web server ----------
+WebServer server(80);
+
+// ---------- OTP state (server-side) ----------
+String currentOTP = "000000";
+unsigned long lastOtpUpdate = 0;
+const unsigned long otpIntervalMs = 5000; // rotate OTP every 5 seconds
+
+// Generate a 6-digit OTP with unique digits (0–9, no repeats)
+String generateOtp() {
+  int digits[10];
+  for (int i = 0; i < 10; i++) digits[i] = i;
+
+  // Fisher–Yates shuffle
+  for (int i = 9; i > 0; i--) {
+    int j = random(0, i + 1);
+    int temp = digits[i];
+    digits[i] = digits[j];
+    digits[j] = temp;
+  }
+
+  char buf[7];
+  for (int i = 0; i < 6; i++) {
+    buf[i] = '0' + digits[i];
+  }
+  buf[6] = '\0';
+  return String(buf);
+}
+
+// ---------- HTML template (with placeholder %OTP%) ----------
+const char PROJECT_HTML_TEMPLATE[] PROGMEM = R"rawliteral(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SMART HOME SECURITY</title>
+  <!-- Auto-reload every 5 seconds to get fresh OTP -->
+  <meta http-equiv="refresh" content="5" />
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#06b6d4;--muted:#94a3b8;--glass: rgba(255,255,255,0.03)}
+    html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,'Helvetica Neue',Arial}
+    body{background:linear-gradient(180deg,#071126 0%, #0b1320 100%);color:#e6eef6;display:flex;align-items:center;justify-content:center;padding:32px}
+    .page{width:960px;max-width:96%;}
+    header{background:radial-gradient(circle at 10% 10%, rgba(6,182,212,0.06), transparent 10%), var(--glass);border-radius:12px;padding:28px 28px 22px;display:flex;align-items:center;gap:18px;box-shadow:0 8px 24px rgba(2,6,23,0.6);backdrop-filter: blur(6px)}
+    .brand{flex:1}
+    .brand h1{margin:0;font-size:22px;letter-spacing:2px}
+    .brand p{margin:6px 0 0;color:var(--muted);font-size:13px}
+    .card{margin-top:18px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:12px;padding:26px;box-shadow:0 8px 40px rgba(2,6,23,0.6)}
+    .code-box{padding:18px;border-radius:10px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.03);display:flex;align-items:center;justify-content:space-between}
+    .code-plain{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Roboto Mono,monospace;font-size:36px;letter-spacing:8px}
+    .muted{color:var(--muted);font-size:13px}
+    footer{margin-top:14px;color:var(--muted);font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header>
+      <div class="brand">
+        <h1>SMART HOME SECURITY</h1>
+        <p>Six-digit rotating security code (auto-refresh every 5 seconds)</p>
+      </div>
+    </header>
+
+    <div class="card">
+      <div class="code-box">
+        <div>
+          <div class="muted">Current code</div>
+          <div class="code-plain">%OTP%</div>
+        </div>
+      </div>
+      <p class="muted" style="margin-top:12px">
+        ⭐ Welcome! Youve arrived at the friendliest, most cheerful corner of your smart home.
+        The system has been practicing its “welcome smile” all day just for you — and honestly, its nailing it.
+        Relax, take a look around, and let the smart stuff handle the serious work while you enjoy the 10/10 vibes. ⭐
+      </p>
+
+      <footer>
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap">
+          <div class="muted">OTP is generated and managed on the ESP32. Page auto-reloads to stay in sync.</div>
+          <div>Built: <span>v1.0</span></div>
+        </div>
+      </footer>
+    </div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Handlers ----------
+
+// Serve your project page with current OTP inserted
+void handleProjectPage() {
+  // Build HTML from template and replace %OTP% with current OTP
+  String page = FPSTR(PROJECT_HTML_TEMPLATE);
+  page.replace("%OTP%", currentOTP);
+
+  // Avoid caching: always get fresh page
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "-1");
+  server.send(200, "text/html", page);
+}
+
+// Redirect any other request to /cpsproject/project.html
+void handleRedirect() {
+  server.sendHeader("Location", String("/cpsproject/project.html"), true);
+  server.send(302, "text/plain", "");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println();
+  Serial.println("Starting CPS Project captive portal...");
+
+  // Seed RNG & initial OTP
+  randomSeed(micros());
+  currentOTP = generateOtp();
+  lastOtpUpdate = millis();
+  Serial.print("Initial OTP: ");
+  Serial.println(currentOTP);
+
+  // 1) Start WiFi in AP mode
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  Serial.print("AP started. SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 2) Start DNS server – send ALL domains to our AP IP
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // 3) Configure HTTP server routes
+  server.on("/cpsproject/project.html", HTTP_GET, handleProjectPage);
+
+  // Captive portal redirect routes
+  server.on("/", HTTP_GET, handleRedirect);
+  server.on("/generate_204", HTTP_GET, handleRedirect);  // Android
+  server.on("/fwlink", HTTP_GET, handleRedirect);        // Windows
+  server.onNotFound(handleRedirect);                     // Anything else
+
+  server.begin();
+  Serial.println("HTTP server started.");
+}
+
+void loop() {
+  // Rotate OTP on server every otpIntervalMs
+  unsigned long now = millis();
+  if (now - lastOtpUpdate >= otpIntervalMs) {
+    lastOtpUpdate = now;
+    currentOTP = generateOtp();
+    Serial.print("Auto-rotated OTP: ");
+    Serial.println(currentOTP);
+  }
+
+  // Keep DNS and HTTP servers running
+  dnsServer.processNextRequest();
+  server.handleClient();
+}
